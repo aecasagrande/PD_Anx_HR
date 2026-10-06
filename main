@@ -1,0 +1,1209 @@
+"""
+Scientific HRV analysis pipeline (ECG -> R-peaks -> RR -> time HRV).
+Adapted for the Alexithymia VR study (.xlsx files, Shimmer ECG at 250 Hz).
+Includes full Dash interactive visualization capabilities (Time Domain only).
+"""
+import os
+import re
+import time
+import traceback
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+import neurokit2 as nk
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from dash import Dash, dcc, html, Input, Output, callback
+from scipy.interpolate import interp1d
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import ConstantKernel, RationalQuadratic, WhiteKernel
+
+PIPELINE_VERSION = '2.6 (2026-10-05) - VR Study Adapted (Time Domain Only)'
+
+# -----------------------------------------------------------------------------
+# CONFIG
+# -----------------------------------------------------------------------------
+# -- Data Paths & VR Settings -------------------------------------------------
+DATA_FOLDER = Path("/Users/aecasagr/Downloads")
+OUTPUT_DIR = Path("/Users/aecasagr/Downloads/HRV_Values_VR")
+
+ECG_CHANNEL = "ECG_LA-RA_24BIT_CAL"
+SAMPLING_RATE = 250
+BASELINE_SECONDS = 30
+TRIM_ENVIRONMENT_START_SECONDS = 3
+QS_LABELS = {"qs", "quiet standing"}
+GENERAL_LABELS = {"general"}
+INVERT_ECG = False
+
+# -- Run mode / outputs -------------------------------------------------------
+BATCH_MODE = False
+DRY_RUN = False
+SINGLE_FILE = "PDA_005_ECG_VR_processed.xlsx"
+
+# -- Adaptive / Signal Detection Parameters -----------------------------------
+SNAP_WINDOW = 0.05
+NOISE_THRESHOLD = 0.12
+PAD_SECONDS = 5
+EPOCH_TMIN = -0.2
+EPOCH_TMAX = 0.6
+OUTLIER_THRESHOLD = 0.30
+MEDIAN_WINDOW = 11
+MIN_RR_MS = 280
+MAX_RR_MS = 2000
+MORPHOLOGY_CORRELATION_THRESHOLD = 0.75
+DETECTION_METHOD = 'kubios'
+KUBIOS_ALPHA = 8.0
+KUBIOS_WINDOW_BEATS = 91
+KUBIOS_MEDFILT = 11
+KUBIOS_C1 = 0.13
+KUBIOS_C2 = 0.17
+KUBIOS_MRRS_THRESH = 4.5
+KUBIOS_TH_FLOOR_MS = 35.0
+KUBIOS_TH_CEIL_FRAC = 0.20
+PREMATURE_MIN_FRAC = 0.10
+PREMATURE_GRID_TOL = 0.10
+RR_REL_MIN_FRAC = 0.60
+RHYTHM_HALF_WINDOW = 15
+ALTERNATION_HANDLING = 'auto'
+ALTERNATION_MIN_AMP = 0.05
+ALTERNATION_MIN_RUN = 8
+ALTERNATION_PAIR_MIN_BEATS = 1.5
+ALTERNATION_CONTEXT_BEATS = 30
+ALTERNATION_SUSTAINED_FRAC = 0.25
+EARLY_CHECK_FRAC = 0.90
+EARLY_CHECK_WARN_PCT = 5.0
+EARLY_BEAT_HANDLING = 'report'
+RECORDING_GAP_HANDLING = 'exclude'
+RECORDING_GAP_MIN_SEC = 0.5
+MIN_SEGMENT_DURATION = 15
+ADAPTIVE_EPOCH = True
+EPOCH_POST_RR_FRACTION = 0.65
+EPOCH_PRE_RR_FRACTION = 0.20
+ROLLING_TEMPLATE = True
+TEMPLATE_WINDOW_SEC = 90
+TEMPLATE_N_BEATS = 50
+
+# -- Physiology-driven RR reconstruction --------------------------------------
+MAX_MISSED_BEATS = 4
+MAX_GAP_RECONSTRUCT_SEC = 5.0
+MAX_REPLACE_RUN_SEC = 15.0
+EXTRA_BEAT_RATIO = 1.5
+RR_FILL_METHOD = 'gpr'
+GPR_KERNEL = 'rq'
+GPR_N_RESTARTS = 2
+GPR_RANDOM_STATE = 0
+GPR_MIN_TRAIN = 4
+RR_SUM_CONSTRAINT = 'detection'
+RR_SUM_MAX_OFFSET = 0.10
+
+PROCESSED_DATA = {}
+
+
+# -----------------------------------------------------------------------------
+# VR DATA LOADING & SEGMENTATION
+# -----------------------------------------------------------------------------
+def get_participant_id(file_name):
+    match = re.search(r"PDA[_-]?(\d+)", str(file_name), flags=re.IGNORECASE)
+    return f"PDA_{match.group(1).zfill(3)}" if match else Path(file_name).stem
+
+
+def normalize_label(x):
+    if pd.isna(x): return np.nan
+    x = str(x).strip()
+    return np.nan if x == "" or x.lower() == "nan" else x.lower()
+
+
+def find_header_row(file_path, max_rows=15):
+    preview = pd.read_excel(file_path, header=None, nrows=max_rows)
+    for row_index in range(len(preview)):
+        if preview.iloc[row_index].astype(str).str.contains(ECG_CHANNEL, regex=False, na=False).any():
+            return row_index
+    raise ValueError(f"Could not find the Shimmer ECG header row ({ECG_CHANNEL}).")
+
+
+def load_recording(file_path):
+    try:
+        header_row = find_header_row(file_path)
+        df_original = pd.read_excel(file_path, header=header_row)
+    except Exception as e:
+        print(f"[ERROR] Failed to load {file_path}: {e}")
+        return None
+
+    ecg_candidates = [c for c in df_original.columns if ECG_CHANNEL in str(c)]
+    if len(ecg_candidates) != 1:
+        print(f"[ERROR] Expected exactly one {ECG_CHANNEL} column, found {len(ecg_candidates)}.")
+        return None
+
+    df = pd.DataFrame()
+    df[ECG_CHANNEL] = pd.to_numeric(df_original[ecg_candidates[0]], errors="coerce")
+    if "Environment" not in df_original.columns or "Trial" not in df_original.columns:
+        print("[ERROR] File must contain 'Environment' and 'Trial' columns.")
+        return None
+
+    df["Environment"] = df_original["Environment"]
+    df["Trial"] = pd.to_numeric(df_original["Trial"], errors="coerce")
+    df = df.dropna(subset=[ECG_CHANNEL]).reset_index(drop=True)
+
+    if df.empty:
+        print("[ERROR] No numeric ECG samples found.")
+        return None
+
+    base_time = pd.Timestamp("2000-01-01 00:00:00")
+    df.index = base_time + pd.to_timedelta(np.arange(len(df)) / SAMPLING_RATE, unit='s')
+
+    df["Environment_Normalized"] = df["Environment"].apply(normalize_label)
+    is_environment = (df["Environment_Normalized"].notna() &
+                      ~df["Environment_Normalized"].isin(QS_LABELS) &
+                      ~df["Environment_Normalized"].isin(GENERAL_LABELS))
+
+    prev_is_environment = is_environment.shift(1, fill_value=False)
+    env_changed = df["Environment_Normalized"] != df["Environment_Normalized"].shift(1)
+    trial_changed = df["Trial"].ne(df["Trial"].shift(1))
+    new_block = is_environment & (~prev_is_environment | env_changed | trial_changed)
+    block_id = new_block.cumsum()
+
+    segments = []
+    for cid in block_id[is_environment].unique():
+        block = df.loc[is_environment & (block_id == cid)]
+        if block.empty: continue
+
+        env_name = str(block["Environment"].iloc[0]).strip()
+        t_vals = block["Trial"].dropna().unique()
+        t_num = int(t_vals[0]) if len(t_vals) else "NA"
+
+        env_start, env_end = block.index[0], block.index[-1]
+
+        # Baseline segment
+        baseline_start = env_start - pd.Timedelta(seconds=BASELINE_SECONDS)
+        baseline_end = env_start - pd.Timedelta(seconds=1 / SAMPLING_RATE)
+        if baseline_start >= df.index[0]:
+            segments.append({
+                'name': f"T{t_num}_{env_name}_Baseline", 'start': baseline_start, 'stop': baseline_end,
+                'ecg_channel': ECG_CHANNEL, 'type': 'Baseline'
+            })
+
+        # Environment segment
+        env_trim_start = env_start + pd.Timedelta(seconds=TRIM_ENVIRONMENT_START_SECONDS)
+        if env_end > env_trim_start:
+            segments.append({
+                'name': f"T{t_num}_{env_name}_Environment", 'start': env_trim_start, 'stop': env_end,
+                'ecg_channel': ECG_CHANNEL, 'type': 'Environment'
+            })
+
+    return {'df_raw': df, 'sfreq': SAMPLING_RATE, 'segments': segments, 'files': [Path(file_path).name], 'paths': {}}
+
+
+# -----------------------------------------------------------------------------
+# SIGNAL & ARTEFACT UTILITIES
+# -----------------------------------------------------------------------------
+def snap_to_local_max(signal, peak_indices, fs, window_seconds=0.05):
+    window_samples = int(window_seconds * fs / 2)
+    corrected_peaks = []
+    for peak in peak_indices:
+        start = max(0, peak - window_samples)
+        end = min(len(signal), peak + window_samples)
+        if start >= end:
+            corrected_peaks.append(peak)
+            continue
+        corrected_peaks.append(start + np.argmax(signal[start:end]))
+    return np.array(corrected_peaks)
+
+
+def remove_small_peaks(signal, peak_indices, ratio=0.18):
+    if len(peak_indices) == 0: return peak_indices
+    amplitudes = signal[peak_indices.astype(int)]
+    return peak_indices[amplitudes > np.median(amplitudes) * ratio]
+
+
+def clean_artifact_peaks(peak_indices, signal, fs):
+    if len(peak_indices) < 2: return peak_indices
+    sorted_indices = np.sort(peak_indices)
+    min_dist = int(MIN_RR_MS / 1000 * fs)
+    keep = np.ones(len(sorted_indices), dtype=bool)
+    i = 0
+    while i < len(sorted_indices) - 1:
+        cur, nxt = sorted_indices[i], sorted_indices[i + 1]
+        if (nxt - cur) < min_dist:
+            if signal[int(cur)] < signal[int(nxt)]:
+                keep[i] = False
+            else:
+                keep[i + 1] = False; i += 1
+        i += 1
+    return sorted_indices[keep]
+
+
+def _build_single_template(signal, peak_indices, fs):
+    t_min_s, t_max_s = int(EPOCH_TMIN * fs), int(EPOCH_TMAX * fs)
+    if len(peak_indices) == 0: return np.zeros(max(1, t_max_s - t_min_s))
+    amps = signal[peak_indices.astype(int)]
+    chosen = peak_indices[np.argsort(np.abs(amps - np.median(amps)))[:TEMPLATE_N_BEATS]]
+    beats = [signal[int(p + t_min_s):int(p + t_max_s)] for p in chosen if
+             int(p + t_min_s) >= 0 and int(p + t_max_s) < len(signal)]
+    if not beats: return np.zeros(max(1, t_max_s - t_min_s))
+    min_len = min(len(b) for b in beats)
+    return np.median([b[:min_len] for b in beats], axis=0)
+
+
+def build_templates(signal, peak_indices, fs):
+    global_template = _build_single_template(signal, peak_indices, fs)
+    if not ROLLING_TEMPLATE or len(peak_indices) == 0: return lambda _: global_template, global_template
+    win_samples = int(TEMPLATE_WINDOW_SEC * fs)
+    if win_samples <= 0: return lambda _: global_template, global_template
+    window_templates, win_ids = {}, peak_indices.astype(int) // win_samples
+    for wid in np.unique(win_ids):
+        members = peak_indices[win_ids == wid]
+        window_templates[int(wid)] = _build_single_template(signal, members, fs) if len(members) >= max(10,
+                                                                                                        TEMPLATE_N_BEATS // 4) else global_template
+    return lambda peak_sample: window_templates.get(int(int(peak_sample) // win_samples),
+                                                    global_template), global_template
+
+
+def _local_rr_samples(peak_indices, idx, fs):
+    rr = np.diff(peak_indices)
+    if len(rr) == 0: return fs
+    lo, hi = max(0, idx - MEDIAN_WINDOW // 2), min(len(rr), idx + MEDIAN_WINDOW // 2 + 1)
+    return float(np.median(rr[lo:hi])) if len(rr[lo:hi]) else float(np.median(rr))
+
+
+def detect_ectopic_beats(peak_indices, signal, fs, template_for):
+    n = len(peak_indices)
+    if n < 5: return np.zeros(n, dtype=bool)
+    abs_pre, abs_post = int(EPOCH_TMIN * fs), int(EPOCH_TMAX * fs)
+    correlations = []
+    for i, peak in enumerate(peak_indices):
+        peak = int(peak)
+        template_beat = template_for(peak)
+        if len(template_beat) == 0:
+            correlations.append(1.0);
+            continue
+        if ADAPTIVE_EPOCH:
+            local_rr = _local_rr_samples(peak_indices, i, fs)
+            pre = -int(min(abs(abs_pre), EPOCH_PRE_RR_FRACTION * local_rr))
+            post = int(min(abs_post, EPOCH_POST_RR_FRACTION * local_rr))
+        else:
+            pre, post = abs_pre, abs_post
+        start, end = peak + pre, post + peak
+        if start < 0 or end > len(signal) or end <= start:
+            correlations.append(0.0);
+            continue
+        beat, t_offset = signal[start:end], pre - abs_pre
+        t_slice = template_beat[t_offset:t_offset + (end - start)]
+        min_len = min(len(beat), len(t_slice))
+        if min_len < 3: correlations.append(0.0); continue
+        b, t = beat[:min_len], t_slice[:min_len]
+        correlations.append(np.corrcoef(b, t)[0, 1] if np.std(b) > 0 and np.std(t) > 0 else 0.0)
+    return np.array(correlations) < MORPHOLOGY_CORRELATION_THRESHOLD
+
+
+def _kubios_threshold(sig, alpha, window, ceiling=None):
+    s = pd.Series(np.abs(np.asarray(sig, dtype=float)))
+    q1 = s.rolling(window, center=True, min_periods=1).quantile(0.25).to_numpy()
+    q3 = s.rolling(window, center=True, min_periods=1).quantile(0.75).to_numpy()
+    th = np.maximum(alpha * ((q3 - q1) / 2.0), KUBIOS_TH_FLOOR_MS)
+    if ceiling is not None: th = np.minimum(th, np.maximum(np.asarray(ceiling, dtype=float), KUBIOS_TH_FLOOR_MS))
+    return th
+
+
+def kubios_find_artifacts(rr_ms):
+    rr_ms = np.asarray(rr_ms, dtype=float)
+    m = len(rr_ms)
+    empty = {k: [] for k in ('ectopic', 'missed', 'extra', 'longshort')}
+    if m < 3: return empty, {'medrr': np.array([]), 'th2': np.array([]), 'n_peaks': m + 1}
+    rr = np.concatenate([[float(np.mean(rr_ms))], rr_ms])
+    n = len(rr)
+    medrr = pd.Series(rr).rolling(KUBIOS_MEDFILT, center=True, min_periods=1).median().to_numpy()
+    ceiling = KUBIOS_TH_CEIL_FRAC * medrr if KUBIOS_TH_CEIL_FRAC else None
+    drrs = np.ediff1d(rr, to_begin=0)
+    drrs[0] = float(np.mean(drrs[1:])) if n > 1 else 0.0
+    th1 = _kubios_threshold(drrs, KUBIOS_ALPHA, KUBIOS_WINDOW_BEATS, ceiling)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        drrs = np.divide(drrs, th1, out=np.full_like(drrs, np.nan), where=th1 != 0)
+    padding = 2
+    drrs_pad = np.pad(drrs, padding, 'reflect')
+    s12, s22 = np.zeros(n), np.zeros(n)
+    for d in range(padding, padding + n):
+        if drrs_pad[d] > 0:
+            s12[d - padding] = np.max([drrs_pad[d - 1], drrs_pad[d + 1]])
+        elif drrs_pad[d] < 0:
+            s12[d - padding] = np.min([drrs_pad[d - 1], drrs_pad[d + 1]])
+        if drrs_pad[d] >= 0:
+            s22[d - padding] = np.min([drrs_pad[d + 1], drrs_pad[d + 2]])
+        elif drrs_pad[d] < 0:
+            s22[d - padding] = np.max([drrs_pad[d + 1], drrs_pad[d + 2]])
+    mrrs = rr - medrr
+    mrrs[mrrs < 0] = mrrs[mrrs < 0] * 2
+    th2 = _kubios_threshold(mrrs, KUBIOS_ALPHA, KUBIOS_WINDOW_BEATS, ceiling)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mrrs_n = np.divide(mrrs, th2, out=np.full_like(mrrs, np.nan), where=th2 != 0)
+    c1, c2 = KUBIOS_C1, KUBIOS_C2
+    extra_idcs, missed_idcs, ectopic_idcs, longshort_idcs = [], [], [], []
+    i = 0
+    while i < n - 2:
+        if np.abs(drrs[i]) <= 1:
+            i += 1;
+            continue
+        eq1 = (drrs[i] > 1) and (s12[i] < (-c1 * drrs[i] - c2))
+        eq2 = (drrs[i] < -1) and (s12[i] > (-c1 * drrs[i] + c2))
+        if eq1 or eq2:
+            ectopic_idcs.append(i);
+            i += 1;
+            continue
+        if not ((np.abs(drrs[i]) > 1) or (np.abs(mrrs_n[i]) > KUBIOS_MRRS_THRESH)):
+            i += 1;
+            continue
+        longshort_candidates = [i]
+        if np.abs(drrs[i + 1]) < np.abs(drrs[i + 2]): longshort_candidates.append(i + 1)
+        for j in longshort_candidates:
+            eq3, eq4, eq5 = (drrs[j] > 1) and (s22[j] < -1), np.abs(mrrs_n[j]) > KUBIOS_MRRS_THRESH, (
+                        drrs[j] < -1) and (s22[j] > 1)
+            if not (eq3 or eq4 or eq5): i += 1; continue
+            eq6, eq7 = np.abs(rr[j] / 2 - medrr[j]) < th2[j], np.abs(rr[j] + rr[j + 1] - medrr[j]) < th2[j]
+            if eq5 and eq7: extra_idcs.append(j); i += 1; continue
+            if eq3 and eq6: missed_idcs.append(j); i += 1; continue
+            longshort_idcs.append(j);
+            i += 1
+    return {'ectopic': ectopic_idcs, 'missed': missed_idcs, 'extra': extra_idcs, 'longshort': longshort_idcs}, {
+        'medrr': medrr, 'th2': th2, 'n_peaks': n}
+
+
+def kubios_interval_masks(rr_ms):
+    m = len(rr_ms)
+    masks = {k: np.zeros(m, dtype=bool) for k in ('ectopic', 'missed', 'extra', 'longshort')}
+    if m < 3: return masks
+    classes, _ = kubios_find_artifacts(rr_ms)
+
+    def mark(mask, j):
+        if 0 <= j < m: mask[j] = True
+
+    for i in classes['missed']: mark(masks['missed'], i - 1)
+    for i in classes['longshort']: mark(masks['longshort'], i - 1)
+    for i in classes['ectopic']: mark(masks['ectopic'], i - 2); mark(masks['ectopic'], i - 1)
+    for i in classes['extra']: mark(masks['extra'], i - 1); mark(masks['extra'], i)
+    return masks
+
+
+def compute_rr_bounds(rr_ms):
+    rr_ms = np.asarray(rr_ms, dtype=float)
+    m = len(rr_ms)
+    if DETECTION_METHOD == 'kubios' and m >= 3:
+        _, info = kubios_find_artifacts(rr_ms)
+        medrr, th2 = info['medrr'][1:1 + m], info['th2'][1:1 + m]
+        return medrr - 1.5 * th2, medrr + 3.0 * th2, medrr
+    center = pd.Series(rr_ms).rolling(window=MEDIAN_WINDOW, center=True, min_periods=1).median().to_numpy()
+    half = OUTLIER_THRESHOLD * center
+    return center - half, center + half, center
+
+
+def _local_rhythm(rr_ms, flagged, half=None):
+    half = max(2, int(half)) if half else 15
+    rr_ms, flagged = np.asarray(rr_ms, dtype=float), np.asarray(flagged, dtype=bool)
+    n, clean = len(rr_ms), np.where(flagged, np.nan, rr_ms)
+    loc = pd.Series(clean).rolling(2 * half + 1, center=True, min_periods=5).median().to_numpy()
+    fallback = float(np.nanmedian(clean)) if np.any(np.isfinite(clean)) else float(np.median(rr_ms)) if n else np.nan
+    return np.where(np.isfinite(loc), loc, fallback)
+
+
+def _premature_beat_intervals(rr_ms, flagged, rhythm):
+    rr_ms, flagged = np.asarray(rr_ms, dtype=float), np.asarray(flagged, dtype=bool)
+    n = len(rr_ms)
+    cur, nxt = np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
+    if not PREMATURE_MIN_FRAC or n < 3: return cur, nxt
+    tol, nn_ok = PREMATURE_GRID_TOL or 0.0, ~flagged
+    i = 0
+    while i < n:
+        if not flagged[i]: i += 1; continue
+        s = i
+        while i + 1 < n and flagged[i + 1]: i += 1
+        before = rr_ms[max(0, s - 15):s][nn_ok[max(0, s - 15):s]][-5:]
+        ref = float(np.median(before)) if len(before) >= 3 else float(rhythm[i])
+        c = i
+        while c + 1 < n and not flagged[c + 1] and c - i < 3:
+            if not (ref > 0) or rr_ms[c] >= (1.0 - PREMATURE_MIN_FRAC) * ref: break
+            if c > s:
+                beats = float(rr_ms[s:c + 1].sum()) / ref
+                if round(beats) >= 1 and abs(beats - round(beats)) <= tol: break
+            cur[c], nxt[c + 1] = True, True
+            nn_ok[c + 1] = False
+            c += 1
+        i += 1
+    return cur, nxt
+
+
+def _alternation_mask(rr_ms):
+    rr_ms = np.asarray(rr_ms, dtype=float)
+    n, out = len(rr_ms), np.zeros(len(rr_ms), dtype=bool)
+    if n < 3 or not ALTERNATION_MIN_AMP or not ALTERNATION_MIN_RUN: return out
+    d, big = np.diff(rr_ms), np.abs(np.diff(rr_ms)) >= ALTERNATION_MIN_AMP * (rr_ms[1:] + rr_ms[:-1])
+    i = 0
+    while i < len(d):
+        if not big[i]: i += 1; continue
+        j = i
+        while j + 1 < len(d) and big[j + 1] and np.sign(d[j + 1]) != np.sign(d[j]): j += 1
+        if j - i + 1 >= ALTERNATION_MIN_RUN:
+            a, b = i, j + 1
+            outside, pairs = np.r_[rr_ms[max(0, a - 15):a], rr_ms[b + 1:b + 16]], rr_ms[a:b] + rr_ms[a + 1:b + 1]
+            if len(outside) < 3 or not ALTERNATION_PAIR_MIN_BEATS or np.median(
+                    pairs) >= ALTERNATION_PAIR_MIN_BEATS * np.median(outside):
+                s, e = a, b
+                if rr_ms[s] > rr_ms[s + 1]: s += 1
+                if rr_ms[e] < rr_ms[e - 1] and e + 1 < n: e += 1
+                out[s:e + 1] = True
+        i = j + 1
+    return out
+
+
+def _true_runs(mask):
+    m = np.asarray(mask, dtype=bool)
+    if not m.any(): return []
+    d = np.diff(np.r_[0, m.astype(np.int8), 0])
+    return list(zip(np.where(d == 1)[0], np.where(d == -1)[0] - 1))
+
+
+def _alternation_sustained(rr_ms, alt):
+    rr_ms, alt = np.asarray(rr_ms, dtype=float), np.asarray(alt, dtype=bool)
+    n, out, c = len(alt), np.zeros(len(alt), dtype=bool), int(ALTERNATION_CONTEXT_BEATS)
+    for s, e in _true_runs(alt):
+        lo, hi = max(0, s - c), min(n, e + 1 + c)
+        ctx = np.r_[np.arange(lo, s), np.arange(e + 1, hi)].astype(int)
+        frac = float(alt[ctx].mean()) if len(ctx) else 1.0
+        if (rr_ms[s:e + 1].sum() / 1000.0 > MAX_REPLACE_RUN_SEC or s - lo < 3 or hi - e - 1 < 3
+                or len(ctx) < 15 or frac >= ALTERNATION_SUSTAINED_FRAC):
+            out[s:e + 1] = True
+    return out
+
+
+def recording_gap_intervals(sample_index, peak_positions):
+    pk = np.asarray(peak_positions, dtype=np.int64)
+    out = np.zeros(max(len(pk) - 1, 0), dtype=bool)
+    if len(pk) < 2: return out
+    ns = pd.DatetimeIndex(sample_index).asi8
+    jumps = np.where(np.diff(ns) > RECORDING_GAP_MIN_SEC * 1e9)[0]
+    for j in jumps:
+        k = int(np.searchsorted(pk, j + 1))
+        if 1 <= k < len(pk): out[k - 1] = True
+    return out
+
+
+def unrecorded_seconds(sample_index, t_start, t_stop, sfreq):
+    idx = pd.DatetimeIndex(sample_index)
+    n_in = int(np.sum((idx >= t_start) & (idx <= t_stop)))
+    return max(0.0, (t_stop - t_start).total_seconds() - n_in / float(sfreq))
+
+
+def _unflagged_early_mask(rr_ms, bad):
+    rr_ms, n, out = np.asarray(rr_ms, dtype=float), len(rr_ms), np.zeros(len(rr_ms), dtype=bool)
+    if n < 5 or not EARLY_CHECK_FRAC: return out
+    c = pd.Series(rr_ms).rolling(9, center=True, min_periods=5).median().to_numpy()[1:-1]
+    out[1:-1] = ((rr_ms[1:-1] < EARLY_CHECK_FRAC * c) & (rr_ms[:-2] >= 0.95 * c) & (rr_ms[2:] >= 0.95 * c))
+    return out & ~np.asarray(bad, dtype=bool)
+
+
+def classify_rr_outlier_reasons(rr_ms):
+    rr_ms = np.asarray(rr_ms, dtype=float)
+    n = len(rr_ms)
+    hard = (rr_ms < MIN_RR_MS) | (rr_ms > MAX_RR_MS) if n else np.zeros(n, dtype=bool)
+    handling, alt = ALTERNATION_HANDLING, _alternation_mask(rr_ms) if ALTERNATION_HANDLING != 'off' else np.zeros(n,
+                                                                                                                  dtype=bool)
+    exclude_alt = handling in ('auto', 'exclude') and bool(alt.any())
+    if DETECTION_METHOD == 'kubios' and n >= 4:
+        masks = kubios_interval_masks(rr_ms)
+        masks['alternating'] = alt if exclude_alt else np.zeros(n, dtype=bool)
+        flag_early = EARLY_BEAT_HANDLING == 'flag'
+        if RR_REL_MIN_FRAC or PREMATURE_MIN_FRAC or exclude_alt or flag_early:
+            flagged = hard.copy()
+            for mk in masks.values(): flagged |= mk
+            if RR_REL_MIN_FRAC:
+                rhythm = _local_rhythm(rr_ms, flagged)
+                hard |= (rr_ms < RR_REL_MIN_FRAC * rhythm) & ~flagged
+                flagged |= hard
+            if flag_early:
+                early = _unflagged_early_mask(rr_ms, flagged)
+                masks['ectopic'] = masks['ectopic'] | early
+                flagged |= early
+            if PREMATURE_MIN_FRAC:
+                _, nxt = _premature_beat_intervals(rr_ms, flagged, _local_rhythm(rr_ms, flagged))
+                masks['ectopic'] = masks['ectopic'] | nxt
+        out, used = {'hard': hard.copy()}, hard.copy()
+        for k in ('alternating', 'ectopic', 'missed', 'extra', 'longshort'):
+            mk = masks[k] & ~used
+            out[k], used = mk, used | mk
+    else:
+        lower, upper, _ = compute_rr_bounds(rr_ms)
+        gross = ((rr_ms < lower) | (rr_ms > upper)) & ~hard if n >= 4 else np.zeros(n, dtype=bool)
+        if EARLY_BEAT_HANDLING == 'flag' and n >= 5: gross = gross | _unflagged_early_mask(rr_ms, hard | gross)
+        out = {'hard': hard, 'alternating': (alt & ~hard) if exclude_alt else np.zeros(n, dtype=bool),
+               'gross': gross & ~(alt if exclude_alt else np.zeros(n, dtype=bool))}
+    if handling == 'keep' and alt.any(): out = {k: (v if k == 'hard' else v & ~alt) for k, v in out.items()}
+    return out
+
+
+def detect_outlier_intervals(peak_indices, fs):
+    if len(peak_indices) < 5: return np.zeros(max(0, len(peak_indices) - 1), dtype=bool), np.diff(peak_indices)
+    rr = np.diff(peak_indices)
+    rr_ms = rr / fs * 1000
+    out = np.zeros(len(rr_ms), dtype=bool)
+    for mask in classify_rr_outlier_reasons(rr_ms).values(): out |= mask
+    return out, rr
+
+
+def _interval_masks(peak_indices, fs, ectopic_mask=None, timing_bad=None):
+    if timing_bad is not None and len(timing_bad) == len(peak_indices) - 1:
+        timing_bad, rr = np.asarray(timing_bad, dtype=bool).copy(), np.diff(peak_indices)
+    else:
+        timing_bad, rr = detect_outlier_intervals(peak_indices, fs)
+    bad = timing_bad.copy()
+    if ectopic_mask is not None and len(ectopic_mask) == len(peak_indices) and len(rr) > 0:
+        em = np.asarray(ectopic_mask, dtype=bool)
+        bad |= (em[:-1] | em[1:])
+    return bad, timing_bad, rr
+
+
+def _beat_breakdown(n, runs, unique_bad, alternating, unflagged_early=None, early_kept=None):
+    unique_bad = np.asarray(unique_bad, dtype=bool)
+    ek = np.asarray(early_kept, dtype=bool) if early_kept is not None else None
+    d_extra = d_excl = d_alt = corrected = inserted = kept_runs = c_alt = 0
+    for r in runs:
+        L, k = r['L'], r['k']
+        inner = max(0, L - 1)
+        if r['action'] == 'gap':
+            d, c, i = inner, 0, 0
+            d_excl += inner
+            if r.get('exclusion_reason') == 'alternating rhythm': d_alt += inner
+        elif r['action'] == 'merged':
+            d, c, i = L - k, k - 1, 0; d_extra += L - k
+        elif r['action'] == 'inserted':
+            d, c, i = 0, inner, k - L
+        else:
+            d, c, i = 0, inner, 0
+        corrected += c;
+        inserted += i
+        if ek is not None and r['action'] != 'gap' and len(ek):
+            c_alt += int(np.sum(ek[r['run_s']:max(r['run_s'], r['run_e'] - 1)]))
+        kb = int(unique_bad[r['run_s']]) + int(unique_bad[r['run_e']]) if n else 0
+        kept_runs += kb
+        r.update(beats_dropped=d, beats_corrected=c, beats_inserted=i, bad_beats_kept=kb)
+    n_bad = int(np.sum(unique_bad))
+    dropped = d_extra + d_excl
+    alternating = np.asarray(alternating, dtype=bool)
+    ue = np.asarray(unflagged_early if unflagged_early is not None else np.zeros(len(alternating)), dtype=bool)
+    return {'unique_bad': n_bad, 'dropped': dropped, 'dropped_extra': d_extra, 'dropped_excluded': d_excl,
+            'excluded_alternating': d_alt, 'corrected': corrected, 'corrected_alternating': c_alt, 'inserted': inserted,
+            'kept': n_bad - dropped - corrected, 'kept_check': kept_runs,
+            'alternating_pct': float(100.0 * alternating.mean()) if len(alternating) else 0.0,
+            'unflagged_early_pct': float(100.0 * ue.mean()) if len(ue) else 0.0}
+
+
+def plan_correction_runs(peak_indices, fs, bad, excluded=None, recording_gap=None, early_beats=None):
+    peak_indices, bad, rr = np.asarray(peak_indices), np.asarray(bad, dtype=bool), np.diff(peak_indices).astype(float)
+    n_rr = len(rr)
+    local_median = pd.Series(rr).rolling(window=MEDIAN_WINDOW, center=True, min_periods=1).median().values
+    global_med = float(np.median(rr[~bad])) if np.any(~bad) else float(np.median(rr))
+    runs, j = [], 0
+    while j < n_rr:
+        if not bad[j]: j += 1; continue
+        run_s = j
+        while j < n_rr and bad[j]: j += 1
+        run_e, L, gap = j, j - run_s, float(peak_indices[j] - peak_indices[run_s])
+        neigh = []
+        if run_s - 1 >= 0 and not bad[run_s - 1]: neigh.append(rr[run_s - 1])
+        if run_e < n_rr and not bad[run_e]: neigh.append(rr[run_e])
+        target = float(np.mean(neigh)) if neigh else float(local_median[run_s]) if local_median[
+                                                                                       run_s] > 0 else global_med
+        if target <= 0: target = global_med
+        k = max(1, int(round(gap / target))) if target > 0 else 1
+        eb = (np.asarray(early_beats[run_s:run_e], dtype=bool).copy() if early_beats is not None else np.zeros(L,
+                                                                                                               dtype=bool))
+        rr_run = rr[run_s:run_e]
+        for a in np.where(eb)[0]:
+            if eb[a] and a + 1 < L and eb[a + 1] and rr_run[a] + rr_run[a + 1] < 1.25 * target and min(rr_run[a],
+                                                                                                       rr_run[
+                                                                                                           a + 1]) < 0.5 * target:
+                eb[a] = eb[a + 1] = False
+        n_early = int(np.sum(eb))
+        if n_early and target > 0:
+            rest = gap - float(np.sum(rr_run[eb]))
+            k = max(1, n_early + int(round(max(rest, 0.0) / target)))
+        beats_to_insert, gap_sec, reason = k - L, gap / fs, ''
+        if recording_gap is not None and np.any(recording_gap[run_s:run_e]):
+            reason = 'recording gap'
+        elif excluded is not None and np.any(excluded[run_s:run_e]):
+            reason = 'alternating rhythm'
+        elif beats_to_insert > MAX_MISSED_BEATS:
+            reason = f'more than {MAX_MISSED_BEATS} missed beats'
+        elif beats_to_insert >= 1 and gap_sec > MAX_GAP_RECONSTRUCT_SEC:
+            reason = f'missed beats over {MAX_GAP_RECONSTRUCT_SEC:g} s'
+        elif beats_to_insert <= 0 and gap_sec > MAX_REPLACE_RUN_SEC:
+            reason = f'flagged stretch longer than {MAX_REPLACE_RUN_SEC:g} s'
+        action = 'gap' if reason else 'inserted' if k > L and k >= 2 else 'merged' if k < L else 'replaced'
+        runs.append({'run_s': run_s, 'run_e': run_e, 'L': L, 'k': k, 'gap': gap, 'target': target,
+                     'beats_to_insert': beats_to_insert,
+                     'span_sec': gap_sec, 'action': action, 'exclusion_reason': reason, 'early_beats': n_early})
+    return runs, rr, local_median, global_med
+
+
+def perform_artifact_correction(peak_indices, fs, combined_bad_mask=None, timing_bad=None, alternating=None,
+                                recording_gap=None, alternating_sustained=None):
+    peak_indices = np.asarray(peak_indices)
+    n = len(peak_indices)
+    if n < 5:
+        rr0, m0 = np.diff(peak_indices).astype(float), max(0, n - 1)
+        return {'bad': np.zeros(m0, dtype=bool), 'timing_bad': np.zeros(m0, dtype=bool),
+                'peak_outlier_mask': np.zeros(n, dtype=bool),
+                'corrected_beat_mask': np.zeros(n, dtype=bool), 'corrected_rr': rr0,
+                'reconstructed': peak_indices.astype(float),
+                'gap_mask': np.zeros(m0, dtype=bool), 'corrected_type': np.array(['kept'] * m0, dtype='<U8'),
+                'posterior_sd': np.full(m0, np.nan),
+                'runs': [], 'gpr_fit': 'not run (<5 peaks)', 'beat_fate': np.array(['clean'] * n, dtype='<U8'),
+                'breakdown': {}}
+    bad, timing_bad, _ = _interval_masks(peak_indices, fs, combined_bad_mask, timing_bad)
+    if alternating is None or len(alternating) != n - 1:
+        alternating = _alternation_mask(np.diff(peak_indices) / fs * 1000.0)
+        alternating_sustained = None
+    alternating = np.asarray(alternating, dtype=bool)
+    if alternating_sustained is None or len(alternating_sustained) != n - 1:
+        alternating_sustained = _alternation_sustained(np.diff(peak_indices) / fs * 1000.0, alternating)
+    alternating_sustained = np.asarray(alternating_sustained, dtype=bool) & alternating
+    alt_excl, alt_keep = (alternating, None) if ALTERNATION_HANDLING == 'exclude' else (alternating_sustained,
+                                                                                        alternating & ~alternating_sustained) if ALTERNATION_HANDLING == 'auto' else (
+        None, None)
+    rec_gap = np.asarray(recording_gap, dtype=bool) if recording_gap is not None and len(
+        recording_gap) == n - 1 and RECORDING_GAP_HANDLING == 'exclude' else np.zeros(n - 1, dtype=bool)
+    if rec_gap.any(): bad, timing_bad = bad | rec_gap, timing_bad | rec_gap
+    runs, rr, local_median, global_med = plan_correction_runs(peak_indices, fs, bad, excluded=(
+                alt_excl & bad) if alt_excl is not None else None, recording_gap=rec_gap, early_beats=(
+                alt_keep & bad) if alt_keep is not None else None)
+
+    n_rr, pos, run_pos, p, j, r_i = len(rr), np.full(len(rr), np.nan), [], 0.0, 0, 0
+    while j < n_rr:
+        if not bad[j]: pos[j], p, j = p, p + 1.0, j + 1; continue
+        run = runs[r_i]
+        run_pos.append(p + np.arange(run['k'], dtype=float))
+        p, j, r_i = p + run['k'], run['run_e'], r_i + 1
+    clean_idx = np.where(~bad)[0]
+    x_clean, y_clean = pos[clean_idx], rr[clean_idx]
+
+    needs_gp = [i for i, r in enumerate(runs) if
+                r['action'] in ('inserted', 'replaced') or (r['action'] == 'merged' and r['k'] >= 2)]
+    gp_mean, gp_sd, gpr_fit = {}, {}, 'not needed'
+    if needs_gp and RR_FILL_METHOD == 'gpr' and len(x_clean) >= GPR_MIN_TRAIN:
+        xq = np.concatenate([run_pos[i] for i in needs_gp])
+        try:
+            kernel = ConstantKernel(1.0, (1e-3, 1e3)) * RationalQuadratic(length_scale=3.0, alpha=1.0,
+                                                                          length_scale_bounds=(0.1, 1e3),
+                                                                          alpha_bounds=(1e-3, 1e3)) + WhiteKernel(
+                noise_level=0.1, noise_level_bounds=(1e-5, 1e1))
+            gp = GaussianProcessRegressor(kernel=kernel, normalize_y=True, n_restarts_optimizer=GPR_N_RESTARTS,
+                                          random_state=GPR_RANDOM_STATE)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', ConvergenceWarning)
+                gp.fit(x_clean.reshape(-1, 1), y_clean)
+            mean, sd = gp.predict(xq.reshape(-1, 1), return_std=True)
+            gpr_fit, o = str(gp.kernel_), 0
+            for i in needs_gp:
+                nq = len(run_pos[i])
+                gp_mean[i], gp_sd[i], o = mean[o:o + nq], sd[o:o + nq], o + nq
+        except Exception as e:
+            gpr_fit = f'GP fit failed: {e}'
+
+    min_rr_s, max_rr_s, corrected, types, ends, gap_flags, sds, j, r_i = MIN_RR_MS / 1000.0 * fs, MAX_RR_MS / 1000.0 * fs, [], [], [], [], [], 0, 0
+    while j < n_rr:
+        if not bad[j]:
+            corrected.append(rr[j]);
+            types.append('kept');
+            ends.append(float(peak_indices[j + 1]));
+            gap_flags.append(False);
+            sds.append(np.nan)
+            j += 1;
+            continue
+        run = runs[r_i]
+        run_s, run_e, L, k, gap, target, action = run['run_s'], run['run_e'], run['L'], run['k'], run['gap'], run[
+            'target'], run['action']
+        start_s, end_s, n_morph = float(peak_indices[run_s]), float(peak_indices[run_e]), int(
+            np.sum(bad[run_s:run_e] & ~timing_bad[run_s:run_e]))
+        run.update(out_start=len(corrected), timing_flagged=L - n_morph, morphology_only=n_morph,
+                   count_fit_offset=np.nan, posterior_sd_mean=np.nan,
+                   gap_to_rr_ratio=gap / target if target > 0 else np.nan)
+        if action == 'gap':
+            corrected.append(gap);
+            types.append('gap');
+            ends.append(end_s);
+            gap_flags.append(True);
+            sds.append(np.nan)
+            run['values_from'] = f"not reconstructed (excluded: {run.get('exclusion_reason') or 'unrecoverable'})"
+        elif action == 'merged' and k == 1:
+            corrected.append(gap);
+            types.append('merged');
+            ends.append(end_s);
+            gap_flags.append(False);
+            sds.append(np.nan)
+            run['values_from'] = 'observed gap'
+        elif action == 'replaced' and L == 1:
+            lm, val, sdv, src = float(local_median[run_s]) if local_median[run_s] > 0 else target, float(
+                local_median[run_s]) if local_median[run_s] > 0 else target, np.nan, 'local median'
+            if r_i in gp_mean:
+                cand = float(gp_mean[r_i][0])
+                if np.isfinite(cand) and max(min_rr_s, 0.5 * lm) <= cand <= min(max_rr_s, 1.5 * lm):
+                    val, sdv, src = cand, float(gp_sd[r_i][0]), 'GPR'
+            corrected.append(val);
+            types.append('replaced');
+            ends.append(end_s);
+            gap_flags.append(False);
+            sds.append(sdv)
+            run.update(values_from=src, posterior_sd_mean=sdv)
+        else:
+            level = float(np.mean(gp_mean[r_i])) if r_i in gp_mean else float(local_median[run_s]) if local_median[
+                                                                                                          run_s] > 0 else target
+            offset = abs(gap / k - level) / level if level > 0 else np.inf
+            run['count_fit_offset'] = offset
+            sum_here = RR_SUM_CONSTRAINT == 'all' or (RR_SUM_CONSTRAINT == 'detection' and action in ('inserted',
+                                                                                                      'merged') and offset <= RR_SUM_MAX_OFFSET)
+            spacing, vals, sdv, src = np.full(k, gap / k), np.full(k, gap / k) if sum_here else np.full(k,
+                                                                                                        target), np.full(
+                k, np.nan), 'equal division' if sum_here else 'RR_local'
+            if r_i in gp_mean:
+                shape, cand = gp_mean[r_i], gp_mean[r_i] + (gap - gp_mean[r_i].sum()) / k
+                use = cand if sum_here else shape
+                lo, hi = max(min_rr_s, 0.5 * target), min(max_rr_s, 1.5 * target)
+                if np.all(np.isfinite(cand)) and np.all((cand >= lo) & (cand <= hi)) and np.all(
+                        (use >= lo) & (use <= hi)):
+                    spacing, vals, sdv, src = cand, use.copy(), gp_sd[r_i], 'GPR'
+            run_ends = start_s + np.cumsum(spacing)
+            run_ends[-1] = end_s
+            for v, e, s in zip(vals, run_ends, sdv):
+                corrected.append(float(v));
+                types.append(action);
+                ends.append(float(e));
+                gap_flags.append(False);
+                sds.append(float(s))
+            run.update(values_from=src,
+                       posterior_sd_mean=float(np.nanmean(sdv)) if np.any(np.isfinite(sdv)) else np.nan)
+        j, r_i = run_e, r_i + 1
+    reconstructed = np.maximum.accumulate(np.concatenate([[float(peak_indices[0])], np.asarray(ends, dtype=float)]))
+    peak_outlier_mask = np.zeros(n, dtype=bool);
+    peak_outlier_mask[:-1] |= bad;
+    peak_outlier_mask[1:] |= bad;
+    peak_outlier_mask[0] = peak_outlier_mask[-1] = False
+    corrected_beat_mask = np.zeros(n, dtype=bool)
+    for run in runs: corrected_beat_mask[run['run_s'] + 1:run['run_e']] = True
+    em = np.asarray(combined_bad_mask, dtype=bool) if combined_bad_mask is not None and len(
+        combined_bad_mask) == n else np.zeros(n, dtype=bool)
+    unique_bad, beat_fate = peak_outlier_mask | em, np.where(peak_outlier_mask | em, 'kept', 'clean').astype('<U8')
+    for run in runs: beat_fate[run['run_s'] + 1:run['run_e']] = 'excluded' if run['action'] == 'gap' else 'moved'
+
+    breakdown = _beat_breakdown(n, runs, unique_bad, alternating, early_kept=alt_keep,
+                                unflagged_early=_unflagged_early_mask(np.diff(peak_indices) / fs * 1000.0, bad))
+
+    return {'bad': bad, 'timing_bad': timing_bad, 'peak_outlier_mask': peak_outlier_mask,
+            'corrected_beat_mask': corrected_beat_mask,
+            'corrected_rr': np.asarray(corrected, dtype=float), 'reconstructed': reconstructed,
+            'gap_mask': np.asarray(gap_flags, dtype=bool),
+            'corrected_type': np.asarray(types, dtype='<U8'), 'posterior_sd': np.asarray(sds, dtype=float),
+            'runs': runs, 'gpr_fit': gpr_fit,
+            'beat_fate': beat_fate, 'breakdown': breakdown}
+
+
+# -----------------------------------------------------------------------------
+# HRV METRICS
+# -----------------------------------------------------------------------------
+def calculate_time_domain_hrv(rr_ms, contiguous=None):
+    nan = float('nan')
+    if len(rr_ms) < 5: return {'HR': nan, 'SDNN': nan, 'RMSSD': nan, 'SDSD': nan, 'pNN50': nan, 'NN_count': len(rr_ms)}
+    rr_ms, diff_rr = np.asarray(rr_ms, dtype=float), np.diff(np.asarray(rr_ms, dtype=float))
+    if contiguous is not None: diff_rr = diff_rr[np.asarray(contiguous, dtype=bool)]
+    out = {'HR': 60000 / np.mean(rr_ms), 'SDNN': np.std(rr_ms, ddof=1), 'RMSSD': nan, 'SDSD': nan, 'pNN50': nan,
+           'NN_count': len(rr_ms)}
+    if len(diff_rr) >= 4:
+        out.update(RMSSD=np.sqrt(np.mean(diff_rr ** 2)), SDSD=np.std(diff_rr, ddof=1),
+                   pNN50=np.sum(np.abs(diff_rr) > 50) / len(diff_rr) * 100)
+    return out
+
+
+def calculate_hrv_metrics(peak_indices, fs, correction):
+    peak_indices = np.asarray(peak_indices)
+    if len(peak_indices) < 5: return None
+    rr_ms = np.diff(peak_indices) / fs * 1000
+    gap_mask, keep, recon = np.asarray(correction['gap_mask'], dtype=bool), ~np.asarray(correction['gap_mask'],
+                                                                                        dtype=bool), np.asarray(
+        correction['reconstructed'], dtype=float)
+    corrected_rr_ms = np.asarray(correction['corrected_rr'], dtype=float)[keep] / fs * 1000
+
+    time_corrected = calculate_time_domain_hrv(corrected_rr_ms, contiguous=np.diff(np.where(keep)[0]) == 1)
+
+    return {'time_raw': calculate_time_domain_hrv(rr_ms), 'time_corrected': time_corrected,
+            'duration_sec': float((peak_indices[-1] - peak_indices[0]) / fs),
+            'n_unrecoverable_gaps': int(np.sum(gap_mask))}
+
+
+# -----------------------------------------------------------------------------
+# TRIAL PROCESSING & DASH PAYLOAD GENERATION
+# -----------------------------------------------------------------------------
+def _positions_to_times(sample_index, positions):
+    positions = np.asarray(positions, dtype=float) if positions is not None else np.array([])
+    if not len(positions): return pd.DatetimeIndex([])
+    ns = pd.DatetimeIndex(sample_index).asi8
+    rel = np.interp(positions, np.arange(len(ns)), (ns - ns[0]).astype(float))
+    return pd.DatetimeIndex(ns[0] + np.round(rel).astype(np.int64))
+
+
+def _plot_payload(ecg_clean, segment_padded, pad_t1, t_start, t_stop):
+    ecg_slice = ecg_clean[len(segment_padded.loc[pad_t1:t_start]):len(segment_padded.loc[pad_t1:t_stop])]
+    time_slice = segment_padded.loc[t_start:t_stop].index
+    return {'ecg_time': time_slice, 'ecg_signal': ecg_slice}
+
+
+def process_trial(seg, df_raw, sfreq, with_plots=False):
+    trial_name, t_start, t_stop = seg['name'], seg['start'], seg['stop']
+    if t_start > df_raw.index[-1] or t_stop < df_raw.index[0]: return None
+    pad_t1, pad_t2 = t_start - pd.Timedelta(seconds=PAD_SECONDS), t_stop + pd.Timedelta(seconds=PAD_SECONDS)
+    segment_padded = df_raw[(df_raw.index >= pad_t1) & (df_raw.index <= pad_t2)]
+    if len(segment_padded) < sfreq * 5: return None
+
+    sig_vals = -segment_padded[ECG_CHANNEL].values if INVERT_ECG else segment_padded[ECG_CHANNEL].values
+    ecg_clean = nk.ecg_clean(sig_vals, sampling_rate=sfreq, method="elgendi2010")
+    _, info = nk.ecg_peaks(ecg_clean, sampling_rate=sfreq, method="neurokit")
+    raw_peaks = info["ECG_R_Peaks"]
+    snapped = snap_to_local_max(ecg_clean, raw_peaks, sfreq, SNAP_WINDOW)
+    filtered = remove_small_peaks(ecg_clean, snapped, ratio=NOISE_THRESHOLD)
+    final_idx = clean_artifact_peaks(filtered, ecg_clean, sfreq)
+
+    peak_times_padded = segment_padded.index[final_idx.astype(int)]
+    mask_valid = (peak_times_padded >= t_start) & (peak_times_padded <= t_stop)
+    valid_peaks_idx, valid_peaks_times = final_idx[mask_valid].astype(int), peak_times_padded[mask_valid]
+    if len(valid_peaks_idx) < 10: return None
+
+    w0, nv = int(np.argmax(mask_valid)), len(valid_peaks_idx)
+    all_idx = final_idx.astype(int)
+    ctx_timing, _ = detect_outlier_intervals(all_idx, sfreq)
+    timing_window = ctx_timing[w0:w0 + nv - 1] if len(ctx_timing) >= w0 + nv - 1 else None
+
+    template_for, _ = build_templates(ecg_clean, valid_peaks_idx, sfreq)
+    ectopic_mask = detect_ectopic_beats(valid_peaks_idx, ecg_clean, sfreq, template_for)
+    correction = perform_artifact_correction(valid_peaks_idx, sfreq, combined_bad_mask=ectopic_mask,
+                                             timing_bad=timing_window)
+    hrv_results = calculate_hrv_metrics(valid_peaks_idx, sfreq, correction)
+    if hrv_results is None: return None
+
+    reconstructed_times = _positions_to_times(segment_padded.index, correction['reconstructed'])
+    trial = {
+        'peak_times': valid_peaks_times, 'peak_y': ecg_clean[valid_peaks_idx],
+        'peak_times_corrected': reconstructed_times, 'peak_y_corrected': ecg_clean[valid_peaks_idx],
+        'raw_rr_ms': np.diff(valid_peaks_idx) / sfreq * 1000.0, 'raw_rr_times': valid_peaks_times[1:],
+        'artifact_mask': correction['peak_outlier_mask'], 'ectopic_mask': ectopic_mask, 'hrv_metrics': hrv_results,
+        'corrected_beat_mask': correction['corrected_beat_mask'],
+        'corrected_rr_ms': correction['corrected_rr'] / sfreq * 1000.0, 'corrected_rr_times': reconstructed_times[1:],
+        'corrected_type': correction['corrected_type'],
+        'runs': correction['runs'], 'gpr_fit': correction['gpr_fit'], 'sfreq': sfreq,
+        'beat_fate': correction['beat_fate'], 'breakdown': correction['breakdown'],
+        'ecg_channel': ECG_CHANNEL, 'type': seg['type'],
+        'unrecorded_s': unrecorded_seconds(segment_padded.index, t_start, t_stop, sfreq)
+    }
+
+    if with_plots:
+        trial.update(_plot_payload(ecg_clean, segment_padded, pad_t1, t_start, t_stop))
+        ctx_rr_ms = np.diff(all_idx) / sfreq * 1000.0
+        cut = slice(w0, w0 + nv - 1)
+        trial['rr_reasons'] = {k: v[cut] for k, v in classify_rr_outlier_reasons(ctx_rr_ms).items()}
+        trial['rr_bounds'] = tuple(np.asarray(b)[cut] for b in compute_rr_bounds(ctx_rr_ms))
+    return trial
+
+
+def export_hrv_to_excel(processed_data, output_path, run_info=None):
+    time_domain_data, quality_data, delta_data = [], [], []
+    baselines = {}
+    for trial_name, data in processed_data.items():
+        if data['type'] == 'Baseline':
+            base_key = trial_name.replace("_Baseline", "")
+            baselines[base_key] = data['hrv_metrics']['time_corrected']
+
+    for trial_name, data in processed_data.items():
+        metrics = data['hrv_metrics']
+        t_raw, t_corr = metrics['time_raw'], metrics['time_corrected']
+        time_domain_data.append({'Trial': trial_name, 'Type': data['type'],
+                                 'HR_Raw': t_raw['HR'], 'RMSSD_Raw': t_raw['RMSSD'],
+                                 'HR_Corrected': t_corr['HR'], 'RMSSD_Corrected': t_corr['RMSSD']})
+
+        quality_data.append({'Trial': trial_name, 'Total_Beats': len(data['peak_times']),
+                             'Duration_Sec': metrics.get('duration_sec', 0)})
+
+        if data['type'] == 'Environment':
+            base_key = trial_name.replace("_Environment", "")
+            if base_key in baselines:
+                delta_bpm = t_corr['HR'] - baselines[base_key]['HR']
+                delta_rmssd = t_corr['RMSSD'] - baselines[base_key]['RMSSD']
+                delta_data.append(
+                    {'Environment': base_key, 'Baseline_HR': baselines[base_key]['HR'], 'Env_HR': t_corr['HR'],
+                     'Delta_HR': delta_bpm,
+                     'Baseline_RMSSD': baselines[base_key]['RMSSD'], 'Env_RMSSD': t_corr['RMSSD'],
+                     'Delta_RMSSD': delta_rmssd})
+
+    df_time, df_quality, df_delta = pd.DataFrame(time_domain_data), pd.DataFrame(quality_data), pd.DataFrame(delta_data)
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        df_time.to_excel(writer, sheet_name='Time_Domain', index=False)
+        if not df_delta.empty: df_delta.to_excel(writer, sheet_name='Delta_Metrics', index=False)
+        df_quality.to_excel(writer, sheet_name='Quality', index=False)
+    print(f"[OK] Excel exported to: {output_path}")
+
+
+# -----------------------------------------------------------------------------
+# DASHBOARD UI COMPONENTS
+# -----------------------------------------------------------------------------
+_TH_S = {'padding': '4px 10px', 'textAlign': 'left', 'borderBottom': '2px solid #dee2e6', 'backgroundColor': '#f0f0f0',
+         'fontSize': '12px', 'fontWeight': 'bold'}
+_TD_S = {'padding': '3px 10px', 'borderBottom': '1px solid #eee', 'fontSize': '12px'}
+_TABLE_S = {'borderCollapse': 'collapse', 'width': '100%', 'marginTop': '6px', 'marginBottom': '10px'}
+
+
+def _time_row(label, raw_val, corr_val, unit):
+    delta = corr_val - raw_val
+    delta_color = '#27ae60' if delta >= 0 else '#c0392b'
+    return html.Tr([
+        html.Td(html.B(label), style=_TD_S),
+        html.Td(f"{raw_val:.1f}", style={**_TD_S, 'textAlign': 'right'}),
+        html.Td(html.B(f"{corr_val:.1f}"), style={**_TD_S, 'textAlign': 'right'}),
+        html.Td(f"{delta:+.1f}", style={**_TD_S, 'textAlign': 'right', 'color': delta_color}),
+        html.Td(unit, style={**_TD_S, 'color': '#888'}),
+    ])
+
+
+def build_stats_panel(t_raw, t_corr, total_beats, n_unique_bad, n_artifact_only, n_ectopic_only, n_both, duration=0,
+                      n_unrecoverable=0, breakdown=None, unrecorded_s=0.0):
+    pct = n_unique_bad / total_beats * 100 if total_beats else 0
+    badge_style = {'display': 'inline-block', 'padding': '1px 8px', 'borderRadius': '3px', 'marginRight': '6px',
+                   'fontSize': '12px', 'fontWeight': 'bold'}
+    b_down = breakdown or {'dropped': 0, 'dropped_extra': 0, 'dropped_excluded': 0, 'corrected': 0, 'kept': 0,
+                           'inserted': 0, 'alternating_pct': 0, 'unflagged_early_pct': 0}
+
+    return [
+        html.Div("HRV Analysis Report - Time Domain",
+                 style={'fontSize': '14px', 'fontWeight': 'bold', 'color': '#2c3e50', 'marginBottom': '8px'}),
+        html.Div([
+            html.Span(f"Beats: {total_beats}", style={**badge_style, 'backgroundColor': '#d5f5e3', 'color': '#1e8449'}),
+            html.Span(f"Bad: {n_unique_bad} ({pct:.1f}%)",
+                      style={**badge_style, 'backgroundColor': '#fadbd8', 'color': '#922b21'}),
+            html.Span(f"Duration: {duration:.0f}s",
+                      style={**badge_style, 'backgroundColor': '#d6eaf8', 'color': '#1a5276'}),
+        ], style={'marginBottom': '4px'}),
+        html.Div(f"Interval-flagged: {n_artifact_only}  |  Ectopic-only: {n_ectopic_only}  |  Both: {n_both}",
+                 style={'fontSize': '11px', 'color': '#666', 'marginBottom': '2px'}),
+        html.Div(
+            f"Bad beats: {b_down.get('dropped', 0)} dropped ({b_down.get('dropped_extra', 0)} extra)  |  {b_down.get('corrected', 0)} corrected  |  {b_down.get('kept', 0)} kept  |  {b_down.get('inserted', 0)} inserted",
+            style={'fontSize': '11px', 'color': '#666', 'marginBottom': '2px'}),
+        html.Hr(style={'margin': '6px 0', 'borderColor': '#dee2e6'}),
+        html.Div("Time-Domain Metrics", style={'fontWeight': 'bold', 'fontSize': '12px', 'color': '#2c3e50'}),
+        html.Table([
+            html.Thead(html.Tr([html.Th("Metric", style=_TH_S), html.Th("Raw", style={**_TH_S, 'textAlign': 'right'}),
+                                html.Th("Corrected", style={**_TH_S, 'textAlign': 'right'}),
+                                html.Th("Delta", style={**_TH_S, 'textAlign': 'right'}),
+                                html.Th("Unit", style=_TH_S)])),
+            html.Tbody([
+                _time_row("HR", t_raw.get('HR', 0), t_corr.get('HR', 0), "bpm"),
+                _time_row("SDNN", t_raw.get('SDNN', 0), t_corr.get('SDNN', 0), "ms"),
+                _time_row("RMSSD", t_raw.get('RMSSD', 0), t_corr.get('RMSSD', 0), "ms"),
+                _time_row("pNN50", t_raw.get('pNN50', 0), t_corr.get('pNN50', 0), "%"),
+            ]),
+        ], style=_TABLE_S)
+    ]
+
+
+GRAPH_STYLE = {'height': '100%', 'width': '100%'}
+GRAPH_CONFIG = {'displaylogo': False, 'responsive': True}
+
+
+def create_dash_app():
+    app = Dash(__name__, suppress_callback_exceptions=True)
+    app.layout = html.Div([
+        html.H2("Scientific HRV Analysis Dashboard - VR Study",
+                style={'textAlign': 'center', 'fontFamily': 'Arial', 'color': '#2c3e50', 'marginBottom': '10px'}),
+        html.Div([
+            html.Div([
+                html.Label("Select Trial:", style={'fontWeight': 'bold', 'display': 'block'}),
+                dcc.Dropdown(id='trial-dropdown', options=[{'label': k, 'value': k} for k in PROCESSED_DATA],
+                             value=list(PROCESSED_DATA)[0] if PROCESSED_DATA else None, clearable=False),
+            ], style={'width': '40%', 'display': 'inline-block', 'verticalAlign': 'top'}),
+        ], style={'width': '95%', 'margin': 'auto', 'padding': '10px', 'backgroundColor': '#f0f0f0',
+                  'borderRadius': '5px', 'marginBottom': '10px'}),
+        html.Div(id='stats-panel', children=[],
+                 style={'width': '95%', 'margin': 'auto', 'padding': '16px 20px', 'backgroundColor': '#f8f9fa',
+                        'border': '2px solid #dee2e6', 'borderRadius': '8px', 'fontFamily': 'monospace',
+                        'marginBottom': '10px'}),
+        html.Div(id='wrap-raw', style={'width': '95%', 'margin': 'auto', 'height': '28vh', 'marginBottom': '6px'},
+                 children=[dcc.Graph(id='graph-uncorrected', style=GRAPH_STYLE, config=GRAPH_CONFIG)]),
+        html.Div(id='wrap-corrected', style={'width': '95%', 'margin': 'auto', 'height': '45vh', 'marginBottom': '6px'},
+                 children=[dcc.Graph(id='graph-corrected', style=GRAPH_STYLE, config=GRAPH_CONFIG)]),
+        html.Div(id='wrap-rr-raw', style={'width': '95%', 'margin': 'auto', 'height': '35vh', 'marginBottom': '6px'},
+                 children=[dcc.Graph(id='graph-rr-uncorrected', style=GRAPH_STYLE, config=GRAPH_CONFIG)]),
+        html.Div(id='wrap-rr-corr', style={'width': '95%', 'margin': 'auto', 'height': '35vh', 'marginBottom': '6px'},
+                 children=[dcc.Graph(id='graph-rr-corrected', style=GRAPH_STYLE, config=GRAPH_CONFIG)]),
+    ], style={'maxWidth': '1400px', 'margin': 'auto', 'padding': '10px'})
+    return app
+
+
+@callback(
+    [Output('graph-uncorrected', 'figure'), Output('graph-corrected', 'figure'),
+     Output('graph-rr-uncorrected', 'figure'), Output('graph-rr-corrected', 'figure'),
+     Output('stats-panel', 'children')],
+    [Input('trial-dropdown', 'value')],
+)
+def update_main_dashboard(trial_name):
+    empty = go.Figure()
+    if not trial_name or trial_name not in PROCESSED_DATA: return empty, empty, empty, empty, []
+    data = PROCESSED_DATA[trial_name]
+    metrics = data['hrv_metrics']
+    t_raw, t_corr = metrics['time_raw'], metrics['time_corrected']
+
+    artifact_mask = data['artifact_mask'][:len(data['peak_times'])]
+    ectopic_mask = data['ectopic_mask'][:len(data['peak_times'])]
+    m = min(len(artifact_mask), len(ectopic_mask))
+    a, e = artifact_mask[:m].astype(bool), ectopic_mask[:m].astype(bool)
+    n_unique_bad = int(np.sum(a | e))
+
+    stats = build_stats_panel(t_raw, t_corr, len(data['peak_times']), n_unique_bad, int(np.sum(a & ~e)),
+                              int(np.sum(e & ~a)), int(np.sum(a & e)), duration=metrics.get('duration_sec', 0),
+                              n_unrecoverable=metrics.get('n_unrecoverable_gaps', 0), breakdown=data.get('breakdown'),
+                              unrecorded_s=data.get('unrecorded_s', 0.0))
+
+    _ui = trial_name
+    corrected_beats = np.asarray(data.get('corrected_beat_mask', artifact_mask), dtype=bool)[:len(data['peak_times'])]
+    fate = np.asarray(data.get('beat_fate', []))[:len(data['peak_times'])]
+    if len(fate) != len(data['peak_times']): fate = np.where(corrected_beats, 'moved', 'clean')
+    moved_b, excl_b = fate == 'moved', fate == 'excluded'
+
+    # 1. Raw ECG
+    fig_raw = go.Figure()
+    fig_raw.add_trace(go.Scatter(x=data['ecg_time'], y=data['ecg_signal'], mode='lines', name='ECG',
+                                 line=dict(color='#34495e', width=1)))
+    kept_raw = ~(moved_b | excl_b | ectopic_mask.astype(bool))
+    fig_raw.add_trace(
+        go.Scatter(x=data['peak_times'][kept_raw], y=data['peak_y'][kept_raw], mode='markers', name='Normal',
+                   marker=dict(color='#27ae60', size=6)))
+    if np.any(moved_b): fig_raw.add_trace(
+        go.Scatter(x=data['peak_times'][moved_b], y=data['peak_y'][moved_b], mode='markers',
+                   name='Flagged (moved/removed)',
+                   marker=dict(color='#e74c3c', size=10, symbol='x', line=dict(width=2))))
+    if np.any(ectopic_mask): fig_raw.add_trace(
+        go.Scatter(x=data['peak_times'][ectopic_mask], y=data['peak_y'][ectopic_mask], mode='markers',
+                   name='Abnormal shape', marker=dict(color='#f39c12', size=8, symbol='diamond')))
+    fig_raw.update_layout(title="Original Signal", uirevision=_ui, margin=dict(l=50, r=50, t=40, b=30),
+                          xaxis_title="Time", hovermode='closest')
+
+    # 2. Corrected ECG
+    t_orig, y_orig = data['peak_times'], np.asarray(data['peak_y'])
+    t_rc = pd.DatetimeIndex(data['peak_times_corrected'])
+    kept = np.isin(t_orig.asi8, t_rc.asi8)
+    new_pos = ~np.isin(t_rc.asi8, t_orig.asi8)
+    y_level = float(np.median(y_orig)) if len(y_orig) else 0.0
+    fig_corr = go.Figure()
+    fig_corr.add_trace(go.Scatter(x=data['ecg_time'], y=data['ecg_signal'], mode='lines', name='Original',
+                                  line=dict(color='#95a5a6', width=1, dash='dot'), opacity=0.5))
+    fig_corr.add_trace(
+        go.Scatter(x=t_orig[kept], y=y_orig[kept], mode='markers', name='Kept', marker=dict(color='#27ae60', size=7)))
+    gone = ~kept & ~excl_b[:len(kept)] if len(excl_b) == len(kept) else ~kept
+    if np.any(gone): fig_corr.add_trace(
+        go.Scatter(x=t_orig[gone], y=y_orig[gone], mode='markers', name='Detected beat (moved/removed)',
+                   marker=dict(color='rgba(231,76,60,0.8)', size=9, symbol='x-thin',
+                               line=dict(width=2, color='rgba(231,76,60,0.8)'))))
+    if np.any(new_pos): fig_corr.add_trace(
+        go.Scatter(x=t_rc[new_pos], y=np.full(int(np.sum(new_pos)), y_level), mode='markers', name='Reconstructed beat',
+                   marker=dict(color='#3498db', size=11, symbol='cross', line=dict(width=1.5, color='#1b4f72'))))
+    fig_corr.update_layout(title="Corrected Peak Alignments", uirevision=_ui, margin=dict(l=50, r=50, t=40, b=30),
+                           xaxis_title="Time", hovermode='closest')
+
+    # 3. Uncorrected RR
+    rr_uncorr = (data['peak_times'][1:] - data['peak_times'][:-1]).total_seconds() * 1000
+    t_rr_uncorr = data['peak_times'][1:]
+    local_median = pd.Series(rr_uncorr).rolling(window=MEDIAN_WINDOW, center=True, min_periods=1).median().values
+    fig_rr_uncorr = go.Figure()
+    fig_rr_uncorr.add_trace(go.Scatter(x=t_rr_uncorr, y=rr_uncorr, mode='lines+markers', name='RR Interval',
+                                       line=dict(color='#34495e', width=1), marker=dict(size=4)))
+    fig_rr_uncorr.add_trace(go.Scatter(x=t_rr_uncorr, y=local_median, mode='lines', name='Local Median',
+                                       line=dict(color='#7f8c8d', dash='dash', width=2)))
+
+    _reasons = data.get('rr_reasons') or classify_rr_outlier_reasons(rr_uncorr)
+    _used = np.zeros(len(rr_uncorr), dtype=bool)
+
+    def _take(mask):
+        mask = np.asarray(mask, dtype=bool)[:len(rr_uncorr)]
+        if len(mask) < len(rr_uncorr): mask = np.concatenate([mask, np.zeros(len(rr_uncorr) - len(mask), dtype=bool)])
+        m = mask & ~_used
+        _used[m] = True
+        return m
+
+    ect_intervals = ectopic_mask[:len(t_rr_uncorr)] | ectopic_mask[1:len(t_rr_uncorr) + 1]
+    _FLAG_STYLES = [
+        (_take(_reasons.get('hard', np.zeros(len(rr_uncorr)))), 'Out of range / short', '#7b241c', 'x', 12),
+        (_take(_reasons.get('ectopic', np.zeros(len(rr_uncorr)))), 'Ectopic', '#e67e22', 'diamond', 11),
+        (_take(ect_intervals), 'Abnormal shape', '#d35400', 'diamond-open', 11),
+        (_take(_reasons.get('missed', np.zeros(len(rr_uncorr)))), 'Missed beat', '#2980b9', 'triangle-up', 12),
+        (_take(_reasons.get('extra', np.zeros(len(rr_uncorr)))), 'Extra beat', '#8e44ad', 'square', 10),
+        (_take(_reasons.get('longshort', np.zeros(len(rr_uncorr)))), 'Long/short', '#16a085', 'circle', 10)
+    ]
+    for sel, lbl, col, sym, sz in _FLAG_STYLES:
+        if np.any(sel): fig_rr_uncorr.add_trace(
+            go.Scatter(x=t_rr_uncorr[sel], y=rr_uncorr[sel], mode='markers', name=lbl,
+                       marker=dict(color=col, size=sz, symbol=sym, line=dict(width=1.5, color='#2c3e50'))))
+    fig_rr_uncorr.update_layout(title="Uncorrected RR Intervals", uirevision=_ui, xaxis_title="Time",
+                                yaxis_title="RR (ms)", margin=dict(l=50, r=50, t=40, b=30), hovermode='closest')
+
+    # 4. Corrected RR
+    rr_corr = np.asarray(data['corrected_rr_ms'], dtype=float)
+    t_rr_corr = data['corrected_rr_times']
+    ctype = np.asarray(data.get('corrected_type', np.array(['kept'] * len(rr_corr))))
+    fig_rr_corr = go.Figure()
+    fig_rr_corr.add_trace(
+        go.Scatter(x=t_rr_corr, y=rr_corr, mode='lines', name='Corrected RR', line=dict(color='#27ae60', width=1.5)))
+    _keep = (ctype == 'kept')
+    if np.any(_keep): fig_rr_corr.add_trace(
+        go.Scatter(x=np.asarray(t_rr_corr)[_keep], y=rr_corr[_keep], mode='markers', name='Kept',
+                   marker=dict(size=4, color='#27ae60')))
+    for key, (lbl, col, sym, sz) in {'replaced': ('Replaced', '#e67e22', 'circle', 11),
+                                     'inserted': ('Inserted', '#2980b9', 'triangle-up', 12),
+                                     'merged': ('Merged', '#8e44ad', 'square', 10)}.items():
+        sel = (ctype == key)
+        if np.any(sel): fig_rr_corr.add_trace(
+            go.Scatter(x=np.asarray(t_rr_corr)[sel], y=rr_corr[sel], mode='markers', name=lbl,
+                       marker=dict(size=sz, color=col, symbol=sym, line=dict(width=1.5, color='#2c3e50'))))
+    fig_rr_corr.update_layout(title="Corrected RR Intervals", uirevision=_ui, xaxis_title="Time", yaxis_title="RR (ms)",
+                              margin=dict(l=50, r=50, t=40, b=30), hovermode='closest')
+
+    return fig_raw, fig_corr, fig_rr_uncorr, fig_rr_corr, stats
+
+
+# -----------------------------------------------------------------------------
+# EXECUTION
+# -----------------------------------------------------------------------------
+def run_single():
+    file_path = DATA_FOLDER / SINGLE_FILE
+    print(f"\n[START] Processing Single File: {file_path}")
+    rec = load_recording(file_path)
+    if not rec:
+        print("[ERROR] Could not load the recording. Please verify the file path.")
+        return
+
+    global PROCESSED_DATA
+    PROCESSED_DATA = {}
+    for seg in rec['segments']:
+        trial = process_trial(seg, rec['df_raw'], rec['sfreq'], with_plots=True)
+        if trial: PROCESSED_DATA[seg['name']] = trial
+
+    if PROCESSED_DATA and not DRY_RUN:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out_path = OUTPUT_DIR / f"HRV_Analysis_{get_participant_id(SINGLE_FILE)}.xlsx"
+        export_hrv_to_excel(PROCESSED_DATA, out_path, run_info={'File': SINGLE_FILE})
+        print(f"[OK] Processed {len(PROCESSED_DATA)} trials (baselines + environments).")
+
+    if PROCESSED_DATA:
+        print("\n" + "=" * 70)
+        print("[START] INTERACTIVE DASHBOARD")
+        print("=" * 70)
+        print("\nOpen your browser: http://127.0.0.1:8050/\n")
+        app = create_dash_app()
+        app.run(debug=True, use_reloader=False)
+    else:
+        print("[WARN] No trials processed successfully.")
+
+
+if __name__ == '__main__':
+    run_single()
