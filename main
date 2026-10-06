@@ -21,7 +21,7 @@ from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import ConstantKernel, RationalQuadratic, WhiteKernel
 
-PIPELINE_VERSION = '2.6 (2026-10-05) - VR Study Adapted (Time Domain Only)'
+PIPELINE_VERSION = '2.7 (2026-10-06) - VR Study, consensus R-peaks for precise HR (Time Domain Only)'
 
 # -----------------------------------------------------------------------------
 # CONFIG
@@ -36,7 +36,7 @@ BASELINE_SECONDS = 30
 TRIM_ENVIRONMENT_START_SECONDS = 3
 QS_LABELS = {"qs", "quiet standing"}
 GENERAL_LABELS = {"general"}
-INVERT_ECG = False
+INVERT_ECG = 'auto'  # True / False / 'auto' (detect lead polarity from the QRS complexes)
 
 # -- Run mode / outputs -------------------------------------------------------
 BATCH_MODE = False
@@ -44,7 +44,6 @@ DRY_RUN = False
 SINGLE_FILE = "PDA_005_ECG_VR_processed.xlsx"
 
 # -- Adaptive / Signal Detection Parameters -----------------------------------
-SNAP_WINDOW = 0.05
 NOISE_THRESHOLD = 0.12
 PAD_SECONDS = 5
 EPOCH_TMIN = -0.2
@@ -85,6 +84,20 @@ EPOCH_PRE_RR_FRACTION = 0.20
 ROLLING_TEMPLATE = True
 TEMPLATE_WINDOW_SEC = 90
 TEMPLATE_N_BEATS = 50
+
+# -- R-peak detection (HR precision) ------------------------------------------
+# The 'neurokit' cleaner keeps the QRS morphology intact (the old 'elgendi2010'
+# band-pass shifted the detected peak ~75 ms onto the ST segment). Peaks are the
+# majority vote of several independent detectors, each snapped to the true R apex.
+CLEAN_METHOD = 'neurokit'
+PEAK_DETECTORS = ('neurokit', 'pantompkins1985', 'nabian2018', 'kalidas2017', 'rodrigues2021')
+PEAK_MIN_VOTES = 3
+PEAK_MERGE_TOL_SEC = 0.06
+PEAK_REFINE_HALF_WIN_SEC = 0.06
+SUBSAMPLE_PEAKS = True  # parabolic interpolation of the R apex (sub-4 ms timing at 250 Hz)
+MISSED_BEAT_SEARCH_RATIO = 1.5  # look for a missed beat in RR > ratio x local median RR
+MISSED_BEAT_MIN_AMP_FRAC = 0.4  # accepted candidate must reach this fraction of the local R amplitude
+DETECT_ON_FULL_RECORDING = True  # clean + detect once per file (no filter edge effects per segment)
 
 # -- Physiology-driven RR reconstruction --------------------------------------
 MAX_MISSED_BEATS = 4
@@ -199,23 +212,12 @@ def load_recording(file_path):
 # -----------------------------------------------------------------------------
 # SIGNAL & ARTEFACT UTILITIES
 # -----------------------------------------------------------------------------
-def snap_to_local_max(signal, peak_indices, fs, window_seconds=0.05):
-    window_samples = int(window_seconds * fs / 2)
-    corrected_peaks = []
-    for peak in peak_indices:
-        start = max(0, peak - window_samples)
-        end = min(len(signal), peak + window_samples)
-        if start >= end:
-            corrected_peaks.append(peak)
-            continue
-        corrected_peaks.append(start + np.argmax(signal[start:end]))
-    return np.array(corrected_peaks)
-
-
-def remove_small_peaks(signal, peak_indices, ratio=0.18):
+def remove_small_peaks(signal, peak_indices, ratio=0.18, window_beats=61):
+    """Drop peaks far below the *local* R amplitude (tracks posture/electrode drift over long recordings)."""
     if len(peak_indices) == 0: return peak_indices
     amplitudes = signal[peak_indices.astype(int)]
-    return peak_indices[amplitudes > np.median(amplitudes) * ratio]
+    local = pd.Series(amplitudes).rolling(window_beats, center=True, min_periods=1).median().to_numpy()
+    return peak_indices[amplitudes > local * ratio]
 
 
 def clean_artifact_peaks(peak_indices, signal, fs):
@@ -233,6 +235,117 @@ def clean_artifact_peaks(peak_indices, signal, fs):
                 keep[i + 1] = False; i += 1
         i += 1
     return sorted_indices[keep]
+
+
+def detect_inverted(ecg_clean, fs):
+    """True if the R wave points down: compares the QRS-local negative vs positive deflections."""
+    _, info = nk.ecg_peaks(ecg_clean, sampling_rate=fs, method='neurokit')
+    pk = np.asarray(info['ECG_R_Peaks'], dtype=int)
+    if len(pk) < 5: return False
+    h, base = int(0.08 * fs), pd.Series(ecg_clean).rolling(int(fs), center=True, min_periods=1).median().to_numpy()
+    pos, neg = [], []
+    for p in pk:
+        a, b = max(0, p - h), min(len(ecg_clean), p + h + 1)
+        w = ecg_clean[a:b] - base[p]
+        pos.append(w.max()); neg.append(-w.min())
+    return bool(np.median(neg) > 1.2 * np.median(pos))
+
+
+def refine_to_apex(signal, peaks, fs, half_win_sec=PEAK_REFINE_HALF_WIN_SEC):
+    h, n = max(1, int(round(half_win_sec * fs))), len(signal)
+    out = np.empty(len(peaks), dtype=int)
+    for i, p in enumerate(np.asarray(peaks, dtype=int)):
+        a, b = max(0, p - h), min(n, p + h + 1)
+        out[i] = a + int(np.argmax(signal[a:b])) if b > a else p
+    return out
+
+
+def subsample_positions(signal, peaks):
+    """Parabolic interpolation of each apex -> fractional sample positions."""
+    peaks = np.asarray(peaks, dtype=int)
+    pos = peaks.astype(float)
+    ok = (peaks > 0) & (peaks < len(signal) - 1)
+    y0, y1, y2 = signal[peaks[ok] - 1], signal[peaks[ok]], signal[peaks[ok] + 1]
+    den = y0 - 2 * y1 + y2
+    with np.errstate(invalid='ignore', divide='ignore'):
+        d = np.where(den < 0, 0.5 * (y0 - y2) / den, 0.0)
+    pos[ok] += np.clip(np.nan_to_num(d), -0.5, 0.5)
+    return pos
+
+
+def _consensus_candidates(signal, fs):
+    """Run every detector, snap to the apex, cluster within tolerance. Returns (positions, votes)."""
+    found = []
+    for k, method in enumerate(PEAK_DETECTORS):
+        try:
+            _, info = nk.ecg_peaks(signal, sampling_rate=fs, method=method)
+            pk = np.asarray(info['ECG_R_Peaks'], dtype=int)
+        except Exception as e:
+            print(f"[WARN] R-peak detector '{method}' failed: {e}")
+            continue
+        if len(pk):
+            snapped = np.unique(refine_to_apex(signal, pk, fs))
+            found.append(np.c_[snapped, np.full(len(snapped), k)])
+    if not found: return np.array([], dtype=int), np.array([], dtype=int)
+    allp = np.concatenate(found)
+    allp = allp[np.argsort(allp[:, 0], kind='stable')]
+    tol = int(round(PEAK_MERGE_TOL_SEC * fs))
+    cut = np.r_[0, np.where(np.diff(allp[:, 0]) > tol)[0] + 1, len(allp)]
+    pos, votes = [], []
+    for a, b in zip(cut[:-1], cut[1:]):
+        cl = allp[a:b]
+        members = cl[:, 0]
+        pos.append(int(members[np.argmax(signal[members])]))
+        votes.append(len(np.unique(cl[:, 1])))
+    return np.asarray(pos, dtype=int), np.asarray(votes, dtype=int)
+
+
+def _recover_missed_beats(signal, peaks, cand, fs):
+    """Insert minority-vote candidates that split an over-long RR into physiological intervals."""
+    if len(peaks) < 5 or len(cand) == 0: return peaks
+    peaks = np.sort(peaks)
+    for _ in range(3):
+        rr = np.diff(peaks).astype(float)
+        med = pd.Series(rr).rolling(MEDIAN_WINDOW, center=True, min_periods=1).median().to_numpy()
+        amp = pd.Series(signal[peaks]).rolling(MEDIAN_WINDOW, center=True, min_periods=1).median().to_numpy()
+        added = []
+        for j in np.where(rr > MISSED_BEAT_SEARCH_RATIO * med)[0]:
+            a, b = peaks[j], peaks[j + 1]
+            inside = cand[(cand > a) & (cand < b)]
+            inside = inside[(inside - a >= 0.6 * med[j]) & (b - inside >= 0.6 * med[j])
+                            & (signal[inside] >= MISSED_BEAT_MIN_AMP_FRAC * amp[j])]
+            if len(inside): added.append(int(inside[np.argmin(np.abs(inside - (a + med[j])))]))
+        if not added: break
+        peaks = np.unique(np.r_[peaks, added])
+    return peaks
+
+
+def detect_r_peaks(raw_signal, fs, invert=None):
+    """Clean ECG and return {'ecg_clean', 'peaks' (int samples), 'peaks_pos' (float samples), 'inverted'}."""
+    raw = np.asarray(raw_signal, dtype=float)
+    ecg_clean = nk.ecg_clean(raw, sampling_rate=fs, method=CLEAN_METHOD)
+    invert = INVERT_ECG if invert is None else invert
+    inverted = detect_inverted(ecg_clean, fs) if invert == 'auto' else bool(invert)
+    if inverted: ecg_clean = -ecg_clean
+    cand, votes = _consensus_candidates(ecg_clean, fs)
+    need = min(PEAK_MIN_VOTES, max(1, len(PEAK_DETECTORS)))
+    peaks = cand[votes >= need]
+    peaks = remove_small_peaks(ecg_clean, peaks, ratio=NOISE_THRESHOLD)
+    peaks = clean_artifact_peaks(peaks, ecg_clean, fs)
+    peaks = _recover_missed_beats(ecg_clean, peaks, cand[votes < need], fs)
+    peaks = clean_artifact_peaks(peaks, ecg_clean, fs).astype(int)
+    pos = subsample_positions(ecg_clean, peaks) if SUBSAMPLE_PEAKS else peaks.astype(float)
+    return {'ecg_clean': ecg_clean, 'peaks': peaks, 'peaks_pos': pos, 'inverted': inverted}
+
+
+def prepare_recording(rec):
+    """Clean + detect R-peaks once over the whole recording; segments then slice this result."""
+    if not DETECT_ON_FULL_RECORDING: return rec
+    det = detect_r_peaks(rec['df_raw'][ECG_CHANNEL].values, rec['sfreq'])
+    rec['detection'] = det
+    print(f"[INFO] {len(det['peaks'])} R-peaks detected over the recording"
+          f"{' (ECG polarity inverted)' if det['inverted'] else ''}.")
+    return rec
 
 
 def _build_single_template(signal, peak_indices, fs):
@@ -810,11 +923,14 @@ def perform_artifact_correction(peak_indices, fs, combined_bad_mask=None, timing
 # -----------------------------------------------------------------------------
 def calculate_time_domain_hrv(rr_ms, contiguous=None):
     nan = float('nan')
-    if len(rr_ms) < 5: return {'HR': nan, 'SDNN': nan, 'RMSSD': nan, 'SDSD': nan, 'pNN50': nan, 'NN_count': len(rr_ms)}
+    if len(rr_ms) < 5: return {'HR': nan, 'HR_median': nan, 'HR_min': nan, 'HR_max': nan, 'SDNN': nan,
+                               'RMSSD': nan, 'SDSD': nan, 'pNN50': nan, 'NN_count': len(rr_ms)}
     rr_ms, diff_rr = np.asarray(rr_ms, dtype=float), np.diff(np.asarray(rr_ms, dtype=float))
     if contiguous is not None: diff_rr = diff_rr[np.asarray(contiguous, dtype=bool)]
-    out = {'HR': 60000 / np.mean(rr_ms), 'SDNN': np.std(rr_ms, ddof=1), 'RMSSD': nan, 'SDSD': nan, 'pNN50': nan,
-           'NN_count': len(rr_ms)}
+    inst_hr = 60000.0 / rr_ms
+    out = {'HR': 60000 / np.mean(rr_ms), 'HR_median': float(np.median(inst_hr)),
+           'HR_min': float(np.percentile(inst_hr, 5)), 'HR_max': float(np.percentile(inst_hr, 95)),
+           'SDNN': np.std(rr_ms, ddof=1), 'RMSSD': nan, 'SDSD': nan, 'pNN50': nan, 'NN_count': len(rr_ms)}
     if len(diff_rr) >= 4:
         out.update(RMSSD=np.sqrt(np.mean(diff_rr ** 2)), SDSD=np.std(diff_rr, ddof=1),
                    pNN50=np.sum(np.abs(diff_rr) > 50) / len(diff_rr) * 100)
@@ -832,9 +948,13 @@ def calculate_hrv_metrics(peak_indices, fs, correction):
 
     time_corrected = calculate_time_domain_hrv(corrected_rr_ms, contiguous=np.diff(np.where(keep)[0]) == 1)
 
+    all_corr = np.asarray(correction['corrected_rr'], dtype=float)
+    ctype = np.asarray(correction['corrected_type'])
     return {'time_raw': calculate_time_domain_hrv(rr_ms), 'time_corrected': time_corrected,
             'duration_sec': float((peak_indices[-1] - peak_indices[0]) / fs),
-            'n_unrecoverable_gaps': int(np.sum(gap_mask))}
+            'n_unrecoverable_gaps': int(np.sum(gap_mask)),
+            'excluded_sec': float(np.sum(all_corr[gap_mask]) / fs),
+            'pct_rr_corrected': float(100.0 * np.mean((ctype != 'kept') & ~gap_mask)) if len(ctype) else 0.0}
 
 
 # -----------------------------------------------------------------------------
@@ -854,56 +974,61 @@ def _plot_payload(ecg_clean, segment_padded, pad_t1, t_start, t_stop):
     return {'ecg_time': time_slice, 'ecg_signal': ecg_slice}
 
 
-def process_trial(seg, df_raw, sfreq, with_plots=False):
+def process_trial(seg, df_raw, sfreq, with_plots=False, detection=None):
     trial_name, t_start, t_stop = seg['name'], seg['start'], seg['stop']
     if t_start > df_raw.index[-1] or t_stop < df_raw.index[0]: return None
     pad_t1, pad_t2 = t_start - pd.Timedelta(seconds=PAD_SECONDS), t_stop + pd.Timedelta(seconds=PAD_SECONDS)
-    segment_padded = df_raw[(df_raw.index >= pad_t1) & (df_raw.index <= pad_t2)]
+    i0 = int(df_raw.index.searchsorted(pad_t1, side='left'))
+    i1 = int(df_raw.index.searchsorted(pad_t2, side='right'))
+    segment_padded = df_raw.iloc[i0:i1]
     if len(segment_padded) < sfreq * 5: return None
 
-    sig_vals = -segment_padded[ECG_CHANNEL].values if INVERT_ECG else segment_padded[ECG_CHANNEL].values
-    ecg_clean = nk.ecg_clean(sig_vals, sampling_rate=sfreq, method="elgendi2010")
-    _, info = nk.ecg_peaks(ecg_clean, sampling_rate=sfreq, method="neurokit")
-    raw_peaks = info["ECG_R_Peaks"]
-    snapped = snap_to_local_max(ecg_clean, raw_peaks, sfreq, SNAP_WINDOW)
-    filtered = remove_small_peaks(ecg_clean, snapped, ratio=NOISE_THRESHOLD)
-    final_idx = clean_artifact_peaks(filtered, ecg_clean, sfreq)
+    if detection is not None:
+        ecg_clean, ecg_inverted = detection['ecg_clean'][i0:i1], detection['inverted']
+        sel = (detection['peaks'] >= i0) & (detection['peaks'] < i1)
+        final_idx, final_pos = detection['peaks'][sel] - i0, detection['peaks_pos'][sel] - i0
+    else:
+        det = detect_r_peaks(segment_padded[ECG_CHANNEL].values, sfreq)
+        ecg_clean, final_idx, final_pos = det['ecg_clean'], det['peaks'], det['peaks_pos']
+        ecg_inverted = det['inverted']
+    if len(final_idx) < 10: return None
 
-    peak_times_padded = segment_padded.index[final_idx.astype(int)]
-    mask_valid = (peak_times_padded >= t_start) & (peak_times_padded <= t_stop)
-    valid_peaks_idx, valid_peaks_times = final_idx[mask_valid].astype(int), peak_times_padded[mask_valid]
+    peak_times_padded = segment_padded.index[final_idx]
+    mask_valid = np.asarray((peak_times_padded >= t_start) & (peak_times_padded <= t_stop))
+    valid_peaks_idx, valid_peaks_times = final_idx[mask_valid], peak_times_padded[mask_valid]
+    valid_pos = final_pos[mask_valid]  # fractional sample positions -> RR / HR
+    valid_peaks_times = _positions_to_times(segment_padded.index, valid_pos)
     if len(valid_peaks_idx) < 10: return None
 
     w0, nv = int(np.argmax(mask_valid)), len(valid_peaks_idx)
-    all_idx = final_idx.astype(int)
-    ctx_timing, _ = detect_outlier_intervals(all_idx, sfreq)
+    ctx_timing, _ = detect_outlier_intervals(final_pos, sfreq)
     timing_window = ctx_timing[w0:w0 + nv - 1] if len(ctx_timing) >= w0 + nv - 1 else None
 
     template_for, _ = build_templates(ecg_clean, valid_peaks_idx, sfreq)
     ectopic_mask = detect_ectopic_beats(valid_peaks_idx, ecg_clean, sfreq, template_for)
-    correction = perform_artifact_correction(valid_peaks_idx, sfreq, combined_bad_mask=ectopic_mask,
+    correction = perform_artifact_correction(valid_pos, sfreq, combined_bad_mask=ectopic_mask,
                                              timing_bad=timing_window)
-    hrv_results = calculate_hrv_metrics(valid_peaks_idx, sfreq, correction)
+    hrv_results = calculate_hrv_metrics(valid_pos, sfreq, correction)
     if hrv_results is None: return None
 
     reconstructed_times = _positions_to_times(segment_padded.index, correction['reconstructed'])
     trial = {
         'peak_times': valid_peaks_times, 'peak_y': ecg_clean[valid_peaks_idx],
         'peak_times_corrected': reconstructed_times, 'peak_y_corrected': ecg_clean[valid_peaks_idx],
-        'raw_rr_ms': np.diff(valid_peaks_idx) / sfreq * 1000.0, 'raw_rr_times': valid_peaks_times[1:],
+        'raw_rr_ms': np.diff(valid_pos) / sfreq * 1000.0, 'raw_rr_times': valid_peaks_times[1:],
         'artifact_mask': correction['peak_outlier_mask'], 'ectopic_mask': ectopic_mask, 'hrv_metrics': hrv_results,
         'corrected_beat_mask': correction['corrected_beat_mask'],
         'corrected_rr_ms': correction['corrected_rr'] / sfreq * 1000.0, 'corrected_rr_times': reconstructed_times[1:],
         'corrected_type': correction['corrected_type'],
         'runs': correction['runs'], 'gpr_fit': correction['gpr_fit'], 'sfreq': sfreq,
         'beat_fate': correction['beat_fate'], 'breakdown': correction['breakdown'],
-        'ecg_channel': ECG_CHANNEL, 'type': seg['type'],
+        'ecg_channel': ECG_CHANNEL, 'type': seg['type'], 'ecg_inverted': ecg_inverted,
         'unrecorded_s': unrecorded_seconds(segment_padded.index, t_start, t_stop, sfreq)
     }
 
     if with_plots:
         trial.update(_plot_payload(ecg_clean, segment_padded, pad_t1, t_start, t_stop))
-        ctx_rr_ms = np.diff(all_idx) / sfreq * 1000.0
+        ctx_rr_ms = np.diff(final_pos) / sfreq * 1000.0
         cut = slice(w0, w0 + nv - 1)
         trial['rr_reasons'] = {k: v[cut] for k, v in classify_rr_outlier_reasons(ctx_rr_ms).items()}
         trial['rr_bounds'] = tuple(np.asarray(b)[cut] for b in compute_rr_bounds(ctx_rr_ms))
@@ -923,10 +1048,15 @@ def export_hrv_to_excel(processed_data, output_path, run_info=None):
         t_raw, t_corr = metrics['time_raw'], metrics['time_corrected']
         time_domain_data.append({'Trial': trial_name, 'Type': data['type'],
                                  'HR_Raw': t_raw['HR'], 'RMSSD_Raw': t_raw['RMSSD'],
-                                 'HR_Corrected': t_corr['HR'], 'RMSSD_Corrected': t_corr['RMSSD']})
+                                 'HR_Corrected': t_corr['HR'], 'HR_Median': t_corr.get('HR_median'),
+                                 'HR_P5': t_corr.get('HR_min'), 'HR_P95': t_corr.get('HR_max'),
+                                 'RMSSD_Corrected': t_corr['RMSSD']})
 
         quality_data.append({'Trial': trial_name, 'Total_Beats': len(data['peak_times']),
-                             'Duration_Sec': metrics.get('duration_sec', 0)})
+                             'Duration_Sec': metrics.get('duration_sec', 0),
+                             'Pct_RR_Corrected': metrics.get('pct_rr_corrected', 0.0),
+                             'Excluded_Sec': metrics.get('excluded_sec', 0.0),
+                             'ECG_Inverted': data.get('ecg_inverted')})
 
         if data['type'] == 'Environment':
             base_key = trial_name.replace("_Environment", "")
@@ -1182,10 +1312,11 @@ def run_single():
         print("[ERROR] Could not load the recording. Please verify the file path.")
         return
 
+    prepare_recording(rec)
     global PROCESSED_DATA
     PROCESSED_DATA = {}
     for seg in rec['segments']:
-        trial = process_trial(seg, rec['df_raw'], rec['sfreq'], with_plots=True)
+        trial = process_trial(seg, rec['df_raw'], rec['sfreq'], with_plots=True, detection=rec.get('detection'))
         if trial: PROCESSED_DATA[seg['name']] = trial
 
     if PROCESSED_DATA and not DRY_RUN:
